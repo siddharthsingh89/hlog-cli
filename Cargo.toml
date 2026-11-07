@@ -1,0 +1,23 @@
+[package]
+name = "hlog"
+version = "0.1.0"
+edition = "2021"
+description = "hlog — a log for humans. Append, tail and grep your hlog from the terminal."
+license = "MIT"
+
+[[bin]]
+name = "hlog"
+path = "src/main.rs"
+
+[dependencies]
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
