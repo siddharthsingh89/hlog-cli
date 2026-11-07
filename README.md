@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://hlog.dev/static/wordmark-dark.svg">
+    <img src="https://hlog.dev/static/wordmark.svg" alt="hlog" width="220">
+  </picture>
+</p>
+
 # hlog CLI
 
 The command line for [hlog.dev](https://hlog.dev), a log for humans: short, timestamped,
