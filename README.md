@@ -1,10 +1,31 @@
 # hlog CLI
 
+The command line for [hlog.dev](https://hlog.dev), a log for humans: short, timestamped,
+append-only lines about your day, formatted like software logs.
+
+## install
+
+macOS / Linux:
+
 ```bash
-cargo install --path .        # or: cargo build --release  ->  target/release/hlog
+curl -fsSL https://hlog.dev/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://hlog.dev/install.ps1 | iex
+```
+
+Or download an archive from the [releases page](https://github.com/siddharthsingh89/hlog-cli/releases/latest),
+or build from source: `cargo install --git https://github.com/siddharthsingh89/hlog-cli`.
+
+## use
+
+```bash
 hlog login                    # device flow: open the URL, enter the code, approve
 hlog "shipped the thing"
-hlog learn "advisory locks are session-scoped"
+hlog learn "advisory locks are session-scoped"   # info debug warn error learn win
 echo "from a pipe" | hlog     # one line per input line, paced at 1 line / 2 s
 hlog tail -f --level LEARN
 hlog feed -f
@@ -14,9 +35,16 @@ hlog unfollow @maya
 hlog logout                   # revokes the token on the server, then deletes it locally
 ```
 
-- Config: `<OS config dir>/hlog/config.toml` (`~/.config/hlog/config.toml` on Linux,
-  `~/Library/Application Support/hlog/` on macOS, `%APPDATA%\hlog\` on Windows), written `0600` on unix.
-- `HLOG_API=http://localhost:8787` points at local dev. A saved token is only sent to the server it was
-  issued by.
+- Config: `<OS config dir>/hlog/config.toml` (`~/.config/hlog/` on Linux, `~/Library/Application Support/hlog/`
+  on macOS, `%APPDATA%\hlog\` on Windows), written `0600` on unix.
+- `HLOG_API=http://localhost:8787` points at a local server. A saved token is only sent to the server it was issued by.
 - Colors only when stdout is a terminal; `NO_COLOR=1` disables them.
 - To log text that starts with a command name: `hlog -- tail is a word too`.
+
+Full docs: <https://hlog.dev/docs/cli>
+
+## releasing
+
+Bump `version` in `Cargo.toml`, commit, then `git tag v0.x.y && git push --tags`. The release workflow builds
+Linux (x86_64/arm64, static musl), macOS (arm64/x86_64) and Windows (x86_64) binaries and attaches them with
+SHA-256 checksums.

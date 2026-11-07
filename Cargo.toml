@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "hlog — a log for humans. Append, tail and grep your hlog from the terminal."
 license = "MIT"
+repository = "https://github.com/siddharthsingh89/hlog-cli"
+homepage = "https://hlog.dev"
 
 [[bin]]
 name = "hlog"
