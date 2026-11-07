@@ -25,7 +25,11 @@ irm https://hlog.dev/install.ps1 | iex
 ```
 
 Or download an archive from the [releases page](https://github.com/siddharthsingh89/hlog-cli/releases/latest),
-or build from source: `cargo install --git https://github.com/siddharthsingh89/hlog-cli`.
+or, with Rust installed:
+
+```bash
+cargo install hlog
+```
 
 ## use
 
