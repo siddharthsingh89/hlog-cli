@@ -43,11 +43,17 @@ hlog feed -f
 hlog grep postgres
 hlog follow @maya --level LEARN
 hlog unfollow @maya
+hlog sync                     # send lines that were queued while offline
 hlog logout                   # revokes the token on the server, then deletes it locally
 ```
 
+**Nothing is lost offline.** If a line can't be sent (no network, server trouble, the daily limit, or not
+logged in), it's saved to `queue.jsonl` next to the config and sent, oldest first, by `hlog sync` or before
+your next line. Each line gets its timestamp when it reaches hlog; the CLI shows when you typed it.
+
 - Config: `<OS config dir>/hlog/config.toml` (`~/.config/hlog/` on Linux, `~/Library/Application Support/hlog/`
   on macOS, `%APPDATA%\hlog\` on Windows), written `0600` on unix.
+- `HLOG_CONFIG_DIR=/some/dir` keeps config and queue somewhere else (CI, tests, a second account).
 - `HLOG_API=http://localhost:8787` points at a local server. A saved token is only sent to the server it was issued by.
 - Colors only when stdout is a terminal; `NO_COLOR=1` disables them.
 - To log text that starts with a command name: `hlog -- tail is a word too`.

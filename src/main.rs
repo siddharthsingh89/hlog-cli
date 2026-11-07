@@ -2,6 +2,7 @@
 mod api;
 mod config;
 mod output;
+mod queue;
 
 use api::{ApiError, Client, Line, DEFAULT_API};
 use output::Style;
@@ -22,6 +23,7 @@ usage:
   hlog grep <query>                full-text search your log
   hlog follow @maya [--level LEARN]
   hlog unfollow @maya
+  hlog sync                        send lines that were queued while offline
   hlog logout                      revoke this machine's token and forget it
   hlog -- tail is a word too       log text that starts with a command name
 
@@ -90,6 +92,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         Some("--") => append(&ctx, &args[1..].join(" "), None),
         Some("login") => login(&ctx),
+        Some("sync") => sync(&ctx),
         Some("logout") => logout(&ctx),
         Some("tail") => {
             let (follow_mode, level, rest) = flags(&args[1..])?;
@@ -164,40 +167,166 @@ fn one_handle(rest: &[String], cmd: &str) -> Result<String, String> {
     }
 }
 
-fn append(ctx: &Ctx, text: &str, level: Option<&str>) -> Result<(), String> {
-    let line = append_with_retry(&ctx.authed()?, text, level)?;
-    println!("{}", ctx.style.line(&line, false));
-    Ok(())
+/// Errors where the line itself is fine and sending later can succeed: keep it in the queue.
+/// (Validation errors like "line is longer than 500 characters" are not retryable.)
+fn retryable(e: &ApiError) -> bool {
+    match e {
+        ApiError::Network(_) => true,
+        ApiError::Http { status, .. } => *status == 401 || *status == 429 || *status >= 500,
+    }
 }
 
-/// Append, waiting out short rate limits (the 2 s burst). Long waits (daily cap) are errors.
-fn append_with_retry(client: &Client, text: &str, level: Option<&str>) -> Result<Line, String> {
+/// Append, waiting out short rate limits (the 2 s burst). Long waits (daily cap) are returned as errors.
+fn append_with_retry(client: &Client, text: &str, level: Option<&str>) -> Result<Line, ApiError> {
+    let mut last = None;
     for _ in 0..5 {
         match client.append(text, level) {
             Ok(l) => return Ok(l),
-            Err(ApiError::Http { status: 429, retry_after: Some(s), .. }) if s <= 60 => sleep(Duration::from_secs(s.max(1))),
-            Err(e) => return Err(e.to_string()),
+            Err(ApiError::Http { status: 429, retry_after: Some(s), code, message }) if s <= 60 => {
+                sleep(Duration::from_secs(s.max(1)));
+                last = Some(ApiError::Http { status: 429, retry_after: Some(s), code, message });
+            }
+            Err(e) => return Err(e),
         }
     }
-    Err("rate limited — try again later".into())
+    Err(last.unwrap_or_else(|| ApiError::Network("rate limited".into())))
+}
+
+fn enqueue(ctx: &Ctx, text: &str, level: Option<&str>, why: &str) -> Result<(), String> {
+    queue::push(&queue::Queued { api: ctx.base.clone(), text: text.to_string(), level: level.map(str::to_string), queued_at: queue::now_local() })?;
+    eprintln!("{} {why}. saved locally; it'll be sent by `hlog sync` or with your next line.", ctx.style.dim("queued:"));
+    Ok(())
+}
+
+fn why(e: &ApiError) -> String {
+    match e {
+        ApiError::Network(_) => "can't reach hlog (offline?)".into(),
+        ApiError::Http { status: 401, .. } => "not logged in (run `hlog login`)".into(),
+        ApiError::Http { status: 429, message, .. } => message.clone(),
+        ApiError::Http { status, .. } => format!("hlog had a problem (HTTP {status})"),
+    }
+}
+
+/// Send queued lines for this server, oldest first, paced at the 1 line / 2 s limit. Stops at the first
+/// retryable failure (the rest stay queued). Returns (sent, still queued).
+fn flush(ctx: &Ctx, client: &Client, verbose: bool) -> Result<(usize, usize), String> {
+    let all = queue::load();
+    let (mine, others): (Vec<_>, Vec<_>) = all.into_iter().partition(|q| q.api == ctx.base);
+    if mine.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut sent = 0;
+    let mut keep = Vec::new();
+    let mut stopped = false;
+    for (i, q) in mine.iter().enumerate() {
+        if stopped {
+            keep.push(q.clone());
+            continue;
+        }
+        if i > 0 {
+            sleep(Duration::from_millis(2100));
+        }
+        match append_with_retry(client, &q.text, q.level.as_deref()) {
+            Ok(l) => {
+                sent += 1;
+                println!("{} {}", ctx.style.line(&l, false), ctx.style.dim(&format!("(queued {})", q.queued_at)));
+            }
+            Err(e) if retryable(&e) => {
+                if verbose {
+                    eprintln!("stopped: {}", why(&e));
+                }
+                keep.push(q.clone());
+                stopped = true;
+            }
+            Err(e) => eprintln!("dropped a queued line that can't be sent ({e}): {}", q.text),
+        }
+    }
+    let left = keep.len();
+    let mut rest = others;
+    rest.extend(keep);
+    queue::save(&rest)?;
+    Ok((sent, left))
+}
+
+fn append(ctx: &Ctx, text: &str, level: Option<&str>) -> Result<(), String> {
+    if ctx.token.is_none() {
+        return enqueue(ctx, text, level, "not logged in (run `hlog login`, then `hlog sync`)");
+    }
+    let client = ctx.client();
+    // Older queued lines go first, so the log keeps the order things were typed in.
+    let (sent, left) = flush(ctx, &client, false)?;
+    if left > 0 {
+        return enqueue(ctx, text, level, &format!("{left} earlier line(s) are still waiting to send"));
+    }
+    if sent > 0 {
+        sleep(Duration::from_millis(2100)); // pace after the queued lines
+    }
+    match append_with_retry(&client, text, level) {
+        Ok(line) => {
+            println!("{}", ctx.style.line(&line, false));
+            Ok(())
+        }
+        Err(e) if retryable(&e) => enqueue(ctx, text, level, &why(&e)),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn append_stdin(ctx: &Ctx) -> Result<(), String> {
-    let client = ctx.authed()?;
     let stdin = std::io::stdin();
+    let client = ctx.client();
+    // Once one line fails for a retryable reason, queue the rest without trying (keeps order).
+    let mut failing: Option<String> = if ctx.token.is_none() { Some("not logged in".into()) } else { None };
+    if failing.is_none() {
+        let (_, left) = flush(ctx, &client, false)?;
+        if left > 0 {
+            failing = Some("earlier queued lines are still waiting".into());
+        }
+    }
     let mut first = true;
+    let mut queued = 0;
     for line in stdin.lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
         if line.trim().is_empty() {
+            continue;
+        }
+        if failing.is_some() {
+            queue::push(&queue::Queued { api: ctx.base.clone(), text: line, level: None, queued_at: queue::now_local() })?;
+            queued += 1;
             continue;
         }
         if !first {
             sleep(Duration::from_millis(2100)); // respect the 1 line / 2 s limit
         }
         first = false;
-        let l = append_with_retry(&client, &line, None)?;
-        println!("{}", ctx.style.line(&l, false));
+        match append_with_retry(&client, &line, None) {
+            Ok(l) => println!("{}", ctx.style.line(&l, false)),
+            Err(e) if retryable(&e) => {
+                failing = Some(why(&e));
+                queue::push(&queue::Queued { api: ctx.base.clone(), text: line, level: None, queued_at: queue::now_local() })?;
+                queued += 1;
+            }
+            Err(e) => eprintln!("skipped ({e}): {line}"),
+        }
     }
+    if queued > 0 {
+        eprintln!(
+            "{} {queued} line(s): {}. saved locally; run `hlog sync` later.",
+            ctx.style.dim("queued:"),
+            failing.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn sync(ctx: &Ctx) -> Result<(), String> {
+    let pending = queue::load().into_iter().filter(|q| q.api == ctx.base).count();
+    if pending == 0 {
+        println!("nothing queued");
+        return Ok(());
+    }
+    let client = ctx.authed()?;
+    let (sent, left) = flush(ctx, &client, true)?;
+    println!("sent {sent} queued line(s){}", if left > 0 { format!(", {left} still queued") } else { String::new() });
     Ok(())
 }
 
@@ -291,6 +420,15 @@ fn login(ctx: &Ctx) -> Result<(), String> {
                 let token = v["token"].as_str().ok_or("bad response from server")?.to_string();
                 config::save(&config::Config { api: Some(ctx.base.clone()), token: Some(token) })?;
                 println!("logged in. token saved to {}", config::path()?.display());
+                println!();
+                println!("next:");
+                println!("  hlog learn \"something you figured out today\"   # write your first line (private by default)");
+                println!("  hlog tail                                         # read it back");
+                println!("  revoke this machine any time: hlog logout, or hlog.dev/settings/tokens");
+                let pending = queue::load().into_iter().filter(|q| q.api == ctx.base).count();
+                if pending > 0 {
+                    println!("you have {pending} queued line(s) — run `hlog sync` to send them");
+                }
                 return Ok(());
             }
             Ok(None) => return Err("bad response from server".into()),
@@ -313,6 +451,10 @@ fn logout(ctx: &Ctx) -> Result<(), String> {
     }
     config::delete()?;
     println!("logged out");
+    let pending = queue::load().len();
+    if pending > 0 {
+        println!("note: {pending} queued line(s) are kept locally; they'll send after `hlog login` + `hlog sync`");
+    }
     Ok(())
 }
 

@@ -10,7 +10,11 @@ pub struct Config {
     pub token: Option<String>,
 }
 
+/// `HLOG_CONFIG_DIR` overrides the location (tests, CI, multiple accounts).
 pub fn path() -> Result<PathBuf, String> {
+    if let Some(d) = std::env::var_os("HLOG_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(d).join("config.toml"));
+    }
     let dir = dirs::config_dir().ok_or("can't find the OS config directory")?;
     Ok(dir.join("hlog").join("config.toml"))
 }
