@@ -64,3 +64,23 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  crates-io:
+    # Publishes the same tagged source to crates.io. Skipped unless the repo has a
+    # CARGO_REGISTRY_TOKEN secret (crates.io → Account settings → API Tokens, scope: publish-update).
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: check tag matches Cargo.toml version
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != Cargo.toml version $v"; exit 1; }
+      - name: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then echo "no CARGO_REGISTRY_TOKEN secret; skipping crates.io"; exit 0; fi
+          cargo publish --locked

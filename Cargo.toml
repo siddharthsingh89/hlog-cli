@@ -6,6 +6,13 @@ description = "hlog — a log for humans. Append, tail and grep your hlog from t
 license = "MIT"
 repository = "https://github.com/siddharthsingh89/hlog-cli"
 homepage = "https://hlog.dev"
+documentation = "https://hlog.dev/docs/cli"
+readme = "README.md"
+keywords = ["cli", "log", "journal", "devlog", "terminal"]
+categories = ["command-line-utilities"]
+rust-version = "1.74"
+# CI config isn't part of the crate.
+exclude = [".github/", ".gitignore"]
 
 [[bin]]
 name = "hlog"
