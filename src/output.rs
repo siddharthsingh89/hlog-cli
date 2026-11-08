@@ -57,11 +57,25 @@ impl Style {
         out
     }
 
-    /// Colour `#tags` (a letter first, so "#1" and "@handle#12" stay plain), same rule as the web.
+    /// Colour `inline code` (a pair of backticks) and `#tags`, same rules as the web: nothing inside
+    /// backticks is a tag. The text itself is printed exactly as stored, backticks included.
     pub fn tags(&self, text: &str) -> String {
         if !self.color {
             return text.to_string();
         }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(open) = rest.find('`') {
+            let Some(len) = rest[open + 1..].find('`').filter(|&n| n > 0) else { break };
+            out.push_str(&self.tag_spans(&rest[..open]));
+            out.push_str(&self.paint("35", &rest[open..open + len + 2]));
+            rest = &rest[open + len + 2..];
+        }
+        out.push_str(&self.tag_spans(rest));
+        out
+    }
+
+    fn tag_spans(&self, text: &str) -> String {
         let chars: Vec<char> = text.chars().collect();
         let mut out = String::with_capacity(text.len());
         let mut i = 0;
@@ -98,5 +112,16 @@ mod tests {
         assert!(!out.contains("\x1b[36m#12"));
         assert!(!out.contains("\x1b[36m#1"));
         assert_eq!(Style { color: false }.tags("plain #rust"), "plain #rust");
+    }
+
+    #[test]
+    fn colours_inline_code_and_skips_tags_inside_it() {
+        let s = Style { color: true };
+        let out = s.tags("use `#include <x>` then #cpp, and a lone ` stays");
+        assert!(out.contains("\x1b[35m`#include <x>`\x1b[0m"));
+        assert!(!out.contains("\x1b[36m#include"));
+        assert!(out.contains("\x1b[36m#cpp\x1b[0m"));
+        assert!(out.ends_with("a lone ` stays"));
+        assert_eq!(s.tags("``"), "``");
     }
 }
