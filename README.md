@@ -43,6 +43,10 @@ hlog feed -f
 hlog grep postgres
 hlog follow @maya --level LEARN
 hlog unfollow @maya
+hlog review                   # your week, grouped by level (LEARN and WIN first)
+hlog everyone -f              # public lines from people who opted in to discovery
+hlog search "#rust"           # search everyone's public lines (or a #tag)
+hlog feedback "the feed is confusing"   # goes straight to the person building hlog
 hlog sync                     # send lines that were queued while offline
 hlog logout                   # revokes the token on the server, then deletes it locally
 ```
@@ -55,7 +59,9 @@ your next line. Each line gets its timestamp when it reaches hlog; the CLI shows
   on macOS, `%APPDATA%\hlog\` on Windows), written `0600` on unix.
 - `HLOG_CONFIG_DIR=/some/dir` keeps config and queue somewhere else (CI, tests, a second account).
 - `HLOG_API=http://localhost:8787` points at a local server. A saved token is only sent to the server it was issued by.
-- Colors only when stdout is a terminal; `NO_COLOR=1` disables them.
+- Colors only when stdout is a terminal; `NO_COLOR=1` disables them. `#tags` are highlighted.
+- `hlog feed` marks where new lines start since your last look ("-- new since your last look --" / "-- caught up --").
+- Once a day `hlog` checks GitHub for a newer release and prints a one-line hint; `HLOG_NO_UPDATE_CHECK=1` turns it off.
 - To log text that starts with a command name: `hlog -- tail is a word too`.
 
 Full docs: <https://hlog.dev/docs/cli>

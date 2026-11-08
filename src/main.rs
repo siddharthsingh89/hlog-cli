@@ -3,9 +3,11 @@ mod api;
 mod config;
 mod output;
 mod queue;
+mod state;
 
 use api::{ApiError, Client, Line, DEFAULT_API};
 use output::Style;
+use chrono::TimeZone;
 use std::io::{BufRead, IsTerminal};
 use std::process::ExitCode;
 use std::thread::sleep;
@@ -21,26 +23,35 @@ usage:
   hlog tail [-f] [--level LEARN]   your own log (-f keeps polling)
   hlog feed [-f]                   lines from people you tail
   hlog grep <query>                full-text search your log
+  hlog review [--weeks-ago N]      your week, grouped by level (LEARN and WIN first)
+  hlog everyone [-f] [--level X]   public lines from people who opted in to discovery
+  hlog search <query|#tag>         search everyone's public lines (opted-in people)
+  hlog feedback \"…\" [--no-reply]   tell the person building hlog what you think
   hlog follow @maya [--level LEARN]
   hlog unfollow @maya
   hlog sync                        send lines that were queued while offline
   hlog logout                      revoke this machine's token and forget it
   hlog -- tail is a word too       log text that starts with a command name
 
-env: HLOG_API (default https://hlog.dev), NO_COLOR";
+env: HLOG_API (default https://hlog.dev), NO_COLOR, HLOG_CONFIG_DIR, HLOG_NO_UPDATE_CHECK";
 
 const LEVELS: [&str; 6] = ["info", "debug", "warn", "error", "learn", "win"];
 const POLL_SECS: u64 = 5;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(args) {
+    let quiet = matches!(args.first().map(|s| s.as_str()), Some("-V") | Some("--version"));
+    let code = match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("hlog: {e}");
             ExitCode::FAILURE
         }
+    };
+    if !quiet {
+        update_notice();
     }
+    code
 }
 
 struct Ctx {
@@ -93,6 +104,38 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Some("--") => append(&ctx, &args[1..].join(" "), None),
         Some("login") => login(&ctx),
         Some("sync") => sync(&ctx),
+        Some("feedback") => {
+            let no_reply = args[1..].iter().any(|a| a == "--no-reply");
+            let text = args[1..].iter().filter(|a| *a != "--no-reply").cloned().collect::<Vec<_>>().join(" ");
+            feedback(&ctx, &text, !no_reply)
+        }
+        Some("review") => {
+            let mut weeks = 0u32;
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                if a == "--weeks-ago" {
+                    weeks = it.next().and_then(|v| v.parse().ok()).ok_or("--weeks-ago needs a number")?;
+                } else if let Some(v) = a.strip_prefix("--weeks-ago=") {
+                    weeks = v.parse().map_err(|_| "--weeks-ago needs a number")?;
+                } else {
+                    return Err(format!("unexpected argument: {a}"));
+                }
+            }
+            review(&ctx, weeks)
+        }
+        Some("everyone") => {
+            let (follow_mode, level, rest) = flags(&args[1..])?;
+            no_extra(&rest)?;
+            everyone(&ctx, follow_mode, level)
+        }
+        Some("search") => {
+            let (_, level, rest) = flags(&args[1..])?;
+            let q = rest.join(" ");
+            if q.trim().is_empty() {
+                return Err("usage: hlog search <query>   (or a #tag)".into());
+            }
+            search(&ctx, &q, level)
+        }
         Some("logout") => logout(&ctx),
         Some("tail") => {
             let (follow_mode, level, rest) = flags(&args[1..])?;
@@ -336,13 +379,84 @@ fn print_oldest_first(ctx: &Ctx, lines: &[Line], who: bool) {
     }
 }
 
-/// Shared by `tail` and `feed`: print the latest page, then optionally poll for newer lines.
-fn stream(ctx: &Ctx, path: &str, base_query: Vec<(&str, String)>, follow_mode: bool, who: bool) -> Result<(), String> {
-    let client = ctx.authed()?;
+#[derive(Clone, Copy, PartialEq)]
+enum Stream {
+    Own,
+    /// Your feed: remembers where you stopped reading and marks it.
+    Feed,
+    /// /everyone: no login needed.
+    Public,
+}
+
+/// Print lines oldest-first; in the feed, mark where new lines (since your last look) begin.
+fn print_with_marker(ctx: &Ctx, lines: &[Line], seen: Option<i64>) {
+    for row in marker_rows(lines, seen) {
+        match row {
+            Row::Line(l) => println!("{}", ctx.style.line(l, true)),
+            Row::NewSince => println!("{}", ctx.style.dim("-- new since your last look --")),
+            Row::CaughtUp => println!("{}", ctx.style.dim("-- caught up --")),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Row<'a> {
+    Line(&'a Line),
+    NewSince,
+    CaughtUp,
+}
+
+/// Oldest-first rows with a divider where lines newer than `seen` begin (only if older ones were shown),
+/// or "caught up" at the end when nothing is new. No marker on the very first look (`seen` = None).
+fn marker_rows(lines: &[Line], seen: Option<i64>) -> Vec<Row<'_>> {
+    let mut rows = Vec::new();
+    let mut marked = false;
+    let mut printed_old = false;
+    for l in lines.iter().rev() {
+        if let Some(s) = seen {
+            if !marked && l.ts_ms > s {
+                if printed_old {
+                    rows.push(Row::NewSince);
+                }
+                marked = true;
+            }
+            if l.ts_ms <= s {
+                printed_old = true;
+            }
+        }
+        rows.push(Row::Line(l));
+    }
+    if seen.is_some() && !marked && !lines.is_empty() {
+        rows.push(Row::CaughtUp);
+    }
+    rows
+}
+
+fn remember_feed(ctx: &Ctx, lines: &[Line]) {
+    if let Some(newest) = lines.iter().map(|l| l.ts_ms).max() {
+        let mut st = state::load();
+        let e = st.feed_seen.entry(ctx.base.clone()).or_insert(0);
+        if newest > *e {
+            *e = newest;
+            state::save(&st);
+        }
+    }
+}
+
+/// Shared by `tail`, `feed` and `everyone`: print the latest page, then optionally poll for newer lines.
+fn stream(ctx: &Ctx, path: &str, base_query: Vec<(&str, String)>, follow_mode: bool, kind: Stream) -> Result<(), String> {
+    let who = kind != Stream::Own;
+    let client = if kind == Stream::Public { ctx.client() } else { ctx.authed()? };
     let mut q = base_query.clone();
     q.push(("limit", "20".into()));
     let page = client.page(path, &q).map_err(|e| e.to_string())?;
-    print_oldest_first(ctx, &page.lines, who);
+    if kind == Stream::Feed {
+        let seen = state::load().feed_seen.get(&ctx.base).copied();
+        print_with_marker(ctx, &page.lines, seen);
+        remember_feed(ctx, &page.lines);
+    } else {
+        print_oldest_first(ctx, &page.lines, who);
+    }
     if !follow_mode {
         return Ok(());
     }
@@ -358,6 +472,9 @@ fn stream(ctx: &Ctx, path: &str, base_query: Vec<(&str, String)>, follow_mode: b
                     newest = l.cursor.clone();
                 }
                 print_oldest_first(ctx, &p.lines, who);
+                if kind == Stream::Feed {
+                    remember_feed(ctx, &p.lines);
+                }
             }
             Err(ApiError::Network(_)) => continue, // keep tailing through blips
             Err(e) => return Err(e.to_string()),
@@ -367,12 +484,128 @@ fn stream(ctx: &Ctx, path: &str, base_query: Vec<(&str, String)>, follow_mode: b
 
 fn tail(ctx: &Ctx, follow_mode: bool, level: Option<String>) -> Result<(), String> {
     let q = level.map(|l| vec![("level", l)]).unwrap_or_default();
-    stream(ctx, "/lines", q, follow_mode, false)
+    stream(ctx, "/lines", q, follow_mode, Stream::Own)
 }
 
 fn feed(ctx: &Ctx, follow_mode: bool) -> Result<(), String> {
-    stream(ctx, "/feed", vec![], follow_mode, true)
+    stream(ctx, "/feed", vec![], follow_mode, Stream::Feed)
 }
+
+fn everyone(ctx: &Ctx, follow_mode: bool, level: Option<String>) -> Result<(), String> {
+    let q = level.map(|l| vec![("level", l)]).unwrap_or_default();
+    stream(ctx, "/everyone", q, follow_mode, Stream::Public)
+}
+
+fn search(ctx: &Ctx, q: &str, level: Option<String>) -> Result<(), String> {
+    let mut query = vec![("q", q.to_string())];
+    if let Some(l) = level {
+        query.push(("level", l));
+    }
+    let page = ctx.client().page("/search", &query).map_err(|e| e.to_string())?;
+    if page.lines.is_empty() {
+        eprintln!("no public lines match (only people who opted in to discovery are searchable)");
+    }
+    print_oldest_first(ctx, &page.lines, true);
+    Ok(())
+}
+
+fn feedback(ctx: &Ctx, text: &str, reply: bool) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("usage: hlog feedback \"what's confusing, broken, missing, or great\"".into());
+    }
+    if ctx.token.is_none() {
+        return Err("log in first (`hlog login`), or use https://hlog.dev/feedback".into());
+    }
+    ctx.client().post("/feedback", serde_json::json!({ "text": text, "reply": reply })).map_err(|e| e.to_string())?;
+    println!("thanks — sent to the person building hlog.{}", if reply { " they may reply by email." } else { "" });
+    Ok(())
+}
+
+const REVIEW_ORDER: [&str; 6] = ["LEARN", "WIN", "INFO", "WARN", "ERROR", "DEBUG"];
+
+/// Your week (rolling 7 days, local time), grouped by level, built from your own lines.
+fn review(ctx: &Ctx, weeks_ago: u32) -> Result<(), String> {
+    let client = ctx.authed()?;
+    let day = 86_400_000i64;
+    let to = chrono::Utc::now().timestamp_millis() - weeks_ago as i64 * 7 * day;
+    let from = to - 7 * day;
+    let since = chrono::DateTime::from_timestamp_millis(from).map(|d| d.to_rfc3339()).unwrap_or_default();
+    let mut before = format!("{to}-0");
+    let mut lines: Vec<Line> = Vec::new();
+    for _ in 0..20 {
+        let page = client
+            .page("/lines", &[("since", since.clone()), ("before", before.clone()), ("limit", "200".into())])
+            .map_err(|e| e.to_string())?;
+        lines.extend(page.lines.into_iter().filter(|l| l.level != "SYSTEM"));
+        match page.next {
+            Some(n) => before = n,
+            None => break,
+        }
+    }
+    let local = |ms: i64| chrono::Local.timestamp_millis_opt(ms).single();
+    let label = |ms: i64| local(ms).map(|d| d.format("%-d %b").to_string().to_lowercase()).unwrap_or_default();
+    let days: std::collections::BTreeSet<String> = lines.iter().filter_map(|l| local(l.ts_ms).map(|d| d.format("%F").to_string())).collect();
+    println!(
+        "{} {} – {} · logged on {} of 7 days · {} line{}",
+        if weeks_ago == 0 { "your week:" } else { "week of" },
+        label(from),
+        label(to - 1),
+        days.len(),
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" }
+    );
+    if lines.is_empty() {
+        println!("{}", ctx.style.dim("nothing logged. one line is enough to start: hlog learn \"…\""));
+        return Ok(());
+    }
+    for lvl in REVIEW_ORDER {
+        let mut group: Vec<&Line> = lines.iter().filter(|l| l.level == lvl).collect();
+        if group.is_empty() {
+            continue;
+        }
+        group.sort_by_key(|l| l.ts_ms);
+        println!();
+        println!("{}", ctx.style.dim(&format!("## {lvl} ({})", group.len())));
+        for l in group {
+            println!("{}", ctx.style.line(l, false));
+        }
+    }
+    Ok(())
+}
+
+/// At most once a day, and only on a terminal: tell the user if a newer release exists.
+fn update_notice() {
+    if std::env::var_os("HLOG_NO_UPDATE_CHECK").is_some() || !std::io::stderr().is_terminal() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut st = state::load();
+    if st.update_checked_ms.is_some_and(|t| now - t < 86_400_000) {
+        return;
+    }
+    st.update_checked_ms = Some(now);
+    let latest = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(2))
+        .user_agent(concat!("hlog-cli/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .get("https://api.github.com/repos/siddharthsingh89/hlog-cli/releases/latest")
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<serde_json::Value>().ok())
+        .and_then(|v| v["tag_name"].as_str().map(str::to_string));
+    if let Some(l) = latest {
+        if state::newer(&l, env!("CARGO_PKG_VERSION")) {
+            eprintln!(
+                "\nhlog {} is available (you have {}). update: curl -fsSL https://hlog.dev/install.sh | sh  ·  cargo install hlog",
+                l.trim_start_matches('v'),
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        st.latest_version = Some(l);
+    }
+    state::save(&st);
+}
+
 
 fn grep(ctx: &Ctx, q: &str) -> Result<(), String> {
     let page = ctx.authed()?.page("/lines", &[("q", q.to_string()), ("limit", "100".into())]).map_err(|e| e.to_string())?;
@@ -471,6 +704,21 @@ mod tests {
         assert_eq!(flags(&s(&["-f", "--level", "learn"])).unwrap(), (true, Some("LEARN".into()), vec![]));
         assert_eq!(flags(&s(&["@maya", "--level=win,learn"])).unwrap(), (false, Some("WIN,LEARN".into()), s(&["@maya"])));
         assert!(flags(&s(&["--level"])).is_err());
+    }
+
+    fn line(ts: i64) -> Line {
+        Line { handle: "maya".into(), ts_ms: ts, level: "INFO".into(), text: format!("t{ts}"), cursor: format!("{ts}-1") }
+    }
+
+    #[test]
+    fn feed_marker_positions() {
+        // API order is newest first
+        let lines = vec![line(30), line(20), line(10)];
+        let kinds = |rows: Vec<Row>| rows.iter().map(|r| match r { Row::Line(l) => l.ts_ms.to_string(), Row::NewSince => "NEW".into(), Row::CaughtUp => "UP".into() }).collect::<Vec<_>>().join(",");
+        assert_eq!(kinds(marker_rows(&lines, None)), "10,20,30"); // first look: no marker
+        assert_eq!(kinds(marker_rows(&lines, Some(15))), "10,NEW,20,30");
+        assert_eq!(kinds(marker_rows(&lines, Some(30))), "10,20,30,UP");
+        assert_eq!(kinds(marker_rows(&lines, Some(5))), "10,20,30"); // all new, nothing older shown
     }
 
     #[test]

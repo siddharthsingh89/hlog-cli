@@ -53,7 +53,50 @@ impl Style {
         }
         out.push_str(&self.paint(Self::level_code(&l.level), &level));
         out.push(' ');
-        out.push_str(&l.text);
+        out.push_str(&self.tags(&l.text));
         out
+    }
+
+    /// Colour `#tags` (a letter first, so "#1" and "@handle#12" stay plain), same rule as the web.
+    pub fn tags(&self, text: &str) -> String {
+        if !self.color {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let starts_tag = chars[i] == '#'
+                && (i == 0 || !(chars[i - 1].is_alphanumeric() || matches!(chars[i - 1], '_' | '@' | '/' | '#')))
+                && chars.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic());
+            if starts_tag {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '-') && j - i <= 30 {
+                    j += 1;
+                }
+                let tag: String = chars[i..j].iter().collect();
+                out.push_str(&self.paint("36", &tag));
+                i = j;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Style;
+
+    #[test]
+    fn colours_only_real_tags() {
+        let s = Style { color: true };
+        let out = s.tags("learned #rust today, see @maya#12 and point #1");
+        assert!(out.contains("\x1b[36m#rust\x1b[0m"));
+        assert!(!out.contains("\x1b[36m#12"));
+        assert!(!out.contains("\x1b[36m#1"));
+        assert_eq!(Style { color: false }.tags("plain #rust"), "plain #rust");
     }
 }
