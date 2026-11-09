@@ -34,6 +34,7 @@ usage:
   hlog unfollow @maya
   hlog sync                        send lines that were queued while offline
   hlog logout                      revoke this machine's token and forget it
+  hlog version                     print the version (also -V, --version)
   hlog -- tail is a word too       log text that starts with a command name
 
 env: HLOG_API (default https://hlog.dev), NO_COLOR, HLOG_CONFIG_DIR, HLOG_NO_UPDATE_CHECK";
@@ -43,7 +44,7 @@ const POLL_SECS: u64 = 5;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let quiet = matches!(args.first().map(|s| s.as_str()), Some("-V") | Some("--version"));
+    let quiet = matches!(args.first().map(|s| s.as_str()), Some("-V") | Some("--version")) || (args.len() == 1 && args[0] == "version");
     let code = match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -101,6 +102,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         Some("-V") | Some("--version") => {
+            println!("hlog {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        // `hlog version` on its own is what people type; with more words it's still a line ("version 2 shipped").
+        Some("version") if args.len() == 1 => {
             println!("hlog {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
