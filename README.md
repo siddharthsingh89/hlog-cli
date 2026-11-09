@@ -24,6 +24,14 @@ Windows (PowerShell):
 irm https://hlog.dev/install.ps1 | iex
 ```
 
+With a package manager:
+
+```bash
+brew install siddharthsingh89/hlog/hlog                                   # Homebrew (macOS, Linux)
+scoop bucket add hlog https://github.com/siddharthsingh89/scoop-hlog      # Scoop (Windows)
+scoop install hlog
+```
+
 Or download an archive from the [releases page](https://github.com/siddharthsingh89/hlog-cli/releases/latest),
 or, with Rust installed:
 
