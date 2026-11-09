@@ -84,3 +84,85 @@ jobs:
         run: |
           if [ -z "$CARGO_REGISTRY_TOKEN" ]; then echo "no CARGO_REGISTRY_TOKEN secret; skipping crates.io"; exit 0; fi
           cargo publish --locked
+
+  package-managers:
+    # After the GitHub release: bump the Homebrew tap and Scoop bucket, and submit the winget update.
+    # Each part skips itself unless its secret exists:
+    #   PACKAGE_REPOS_TOKEN: fine-grained token, Contents read/write on homebrew-hlog and scoop-hlog
+    #   WINGET_TOKEN:        classic token with public_repo (opens the PR to microsoft/winget-pkgs)
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    env:
+      PACKAGE_REPOS_TOKEN: ${{ secrets.PACKAGE_REPOS_TOKEN }}
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Homebrew tap and Scoop bucket
+        if: env.PACKAGE_REPOS_TOKEN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"
+          URL="https://github.com/siddharthsingh89/hlog-cli/releases/download/${GITHUB_REF_NAME}"
+          sha() { cut -d' ' -f1 "dist/hlog-$1.sha256"; }
+          git config --global user.name "hlog release"
+          git config --global user.email "release@hlog.dev"
+
+          git clone -q "https://x-access-token:${PACKAGE_REPOS_TOKEN}@github.com/siddharthsingh89/homebrew-hlog.git" tap
+          cat > tap/Formula/hlog.rb <<RUBY
+          class Hlog < Formula
+            desc "Log for humans: append, tail and grep your hlog.dev log from the terminal"
+            homepage "https://hlog.dev"
+            version "${V}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${URL}/hlog-aarch64-apple-darwin.tar.gz"
+                sha256 "$(sha aarch64-apple-darwin.tar.gz)"
+              end
+              on_intel do
+                url "${URL}/hlog-x86_64-apple-darwin.tar.gz"
+                sha256 "$(sha x86_64-apple-darwin.tar.gz)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${URL}/hlog-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "$(sha aarch64-unknown-linux-musl.tar.gz)"
+              end
+              on_intel do
+                url "${URL}/hlog-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "$(sha x86_64-unknown-linux-musl.tar.gz)"
+              end
+            end
+
+            def install
+              bin.install "hlog"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/hlog --version")
+            end
+          end
+          RUBY
+          (cd tap && git add -A && git commit -q -m "hlog ${V}" && git push -q) || echo "tap already at ${V}"
+
+          git clone -q "https://x-access-token:${PACKAGE_REPOS_TOKEN}@github.com/siddharthsingh89/scoop-hlog.git" bucket
+          jq --arg v "$V" --arg u "${URL}/hlog-x86_64-pc-windows-msvc.zip" --arg h "$(sha x86_64-pc-windows-msvc.zip)" \
+            '.version = $v | .architecture."64bit".url = $u | .architecture."64bit".hash = $h' bucket/bucket/hlog.json > hlog.json
+          mv hlog.json bucket/bucket/hlog.json
+          (cd bucket && git add -A && git commit -q -m "hlog ${V}" && git push -q) || echo "bucket already at ${V}"
+      - name: winget
+        if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: hlogdev.hlog
+          installers-regex: 'windows-msvc\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}
+          fork-user: siddharthsingh89
