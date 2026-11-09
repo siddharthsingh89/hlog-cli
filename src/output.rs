@@ -8,9 +8,10 @@ pub struct Style {
 
 impl Style {
     /// Colors only when stdout is a terminal and NO_COLOR is unset (https://no-color.org).
+    /// On Windows the console must also accept colour codes (older consoles print them as `←[2m`).
     pub fn detect() -> Self {
         let no_color = std::env::var_os("NO_COLOR").map(|v| !v.is_empty()).unwrap_or(false);
-        Style { color: !no_color && std::io::stdout().is_terminal() }
+        Style { color: !no_color && std::io::stdout().is_terminal() && enable_ansi() }
     }
 
     fn paint(&self, code: &str, s: &str) -> String {
@@ -98,6 +99,46 @@ impl Style {
         }
         out
     }
+}
+
+/// Windows: turn on "virtual terminal processing" for stdout and stderr so colour codes are applied
+/// instead of printed. Classic consoles (conhost, older PowerShell windows) have it off by default.
+/// Returns false if the console refuses, and then the CLI prints plain text.
+#[cfg(windows)]
+fn enable_ansi() -> bool {
+    type Handle = *mut core::ffi::c_void;
+    extern "system" {
+        fn GetStdHandle(n: u32) -> Handle;
+        fn GetConsoleMode(h: Handle, mode: *mut u32) -> i32;
+        fn SetConsoleMode(h: Handle, mode: u32) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    let mut ok = true;
+    for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain Win32 calls on the process's own standard handles; `mode` is a valid out pointer.
+        unsafe {
+            let h = GetStdHandle(which);
+            let mut mode = 0u32;
+            if h.is_null() || GetConsoleMode(h, &mut mode) == 0 {
+                // Not a console (redirected): nothing to enable. Only stdout decides whether we colour at all.
+                if which == STD_OUTPUT_HANDLE {
+                    ok = false;
+                }
+                continue;
+            }
+            if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0 && SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
+                ok = false;
+            }
+        }
+    }
+    ok
+}
+
+#[cfg(not(windows))]
+fn enable_ansi() -> bool {
+    true
 }
 
 #[cfg(test)]
