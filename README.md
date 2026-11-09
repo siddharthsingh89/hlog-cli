@@ -47,6 +47,9 @@ hlog review                   # your week, grouped by level (LEARN and WIN first
 hlog everyone -f              # public lines from people who opted in to discovery
 hlog search "#rust"           # search everyone's public lines (or a #tag)
 hlog feedback "the feed is confusing"   # goes straight to the person building hlog
+hlog save @maya#12            # privately save someone's public line (hlog unsave @maya#12)
+hlog saved                    # your saved lines (--level LEARN, or a search word)
+hlog review --post | clip     # this week's LEARN and WIN lines as post text (pbcopy on macOS)
 hlog sync                     # send lines that were queued while offline
 hlog logout                   # revokes the token on the server, then deletes it locally
 ```

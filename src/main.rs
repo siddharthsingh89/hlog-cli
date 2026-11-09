@@ -24,9 +24,12 @@ usage:
   hlog feed [-f]                   lines from people you tail
   hlog grep <query>                full-text search your log
   hlog review [--weeks-ago N]      your week, grouped by level (LEARN and WIN first)
+  hlog review --post               this week's LEARN and WIN lines as text to paste into a post
   hlog everyone [-f] [--level X]   public lines from people who opted in to discovery
   hlog search <query|#tag>         search everyone's public lines (opted-in people)
   hlog feedback \"…\" [--no-reply]   tell the person building hlog what you think
+  hlog save @maya#12               privately save someone's public line (unsave @maya#12)
+  hlog saved [--level X] [query]   your saved lines
   hlog follow @maya [--level LEARN]
   hlog unfollow @maya
   hlog sync                        send lines that were queued while offline
@@ -111,9 +114,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         Some("review") => {
             let mut weeks = 0u32;
+            let mut post = false;
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
-                if a == "--weeks-ago" {
+                if a == "--post" {
+                    post = true;
+                } else if a == "--weeks-ago" {
                     weeks = it.next().and_then(|v| v.parse().ok()).ok_or("--weeks-ago needs a number")?;
                 } else if let Some(v) = a.strip_prefix("--weeks-ago=") {
                     weeks = v.parse().map_err(|_| "--weeks-ago needs a number")?;
@@ -121,7 +127,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     return Err(format!("unexpected argument: {a}"));
                 }
             }
-            review(&ctx, weeks)
+            review(&ctx, weeks, post)
         }
         Some("everyone") => {
             let (follow_mode, level, rest) = flags(&args[1..])?;
@@ -135,6 +141,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 return Err("usage: hlog search <query>   (or a #tag)".into());
             }
             search(&ctx, &q, level)
+        }
+        Some("save") | Some("unsave") => {
+            let usage = format!("usage: hlog {} @maya#12", args[0]);
+            let r = match &args[1..] {
+                [one] => parse_ref(one).ok_or(usage)?,
+                _ => return Err(usage),
+            };
+            save_cmd(&ctx, &r, args[0] == "save")
+        }
+        Some("saved") => {
+            let (_, level, rest) = flags(&args[1..])?;
+            saved_cmd(&ctx, level, rest.join(" "))
         }
         Some("logout") => logout(&ctx),
         Some("tail") => {
@@ -292,6 +310,7 @@ fn flush(ctx: &Ctx, client: &Client, verbose: bool) -> Result<(usize, usize), St
 }
 
 fn append(ctx: &Ctx, text: &str, level: Option<&str>) -> Result<(), String> {
+    check_length(text, level)?;
     if ctx.token.is_none() {
         return enqueue(ctx, text, level, "not logged in (run `hlog login`, then `hlog sync`)");
     }
@@ -330,6 +349,10 @@ fn append_stdin(ctx: &Ctx) -> Result<(), String> {
     for line in stdin.lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
         if line.trim().is_empty() {
+            continue;
+        }
+        if let Err(e) = check_length(&line, None) {
+            eprintln!("skipped ({e}): {line}");
             continue;
         }
         if failing.is_some() {
@@ -524,7 +547,7 @@ fn feedback(ctx: &Ctx, text: &str, reply: bool) -> Result<(), String> {
 const REVIEW_ORDER: [&str; 6] = ["LEARN", "WIN", "INFO", "WARN", "ERROR", "DEBUG"];
 
 /// Your week (rolling 7 days, local time), grouped by level, built from your own lines.
-fn review(ctx: &Ctx, weeks_ago: u32) -> Result<(), String> {
+fn review(ctx: &Ctx, weeks_ago: u32, post: bool) -> Result<(), String> {
     let client = ctx.authed()?;
     let day = 86_400_000i64;
     let to = chrono::Utc::now().timestamp_millis() - weeks_ago as i64 * 7 * day;
@@ -541,6 +564,24 @@ fn review(ctx: &Ctx, weeks_ago: u32) -> Result<(), String> {
             Some(n) => before = n,
             None => break,
         }
+    }
+    if post {
+        let mut sorted: Vec<&Line> = lines.iter().collect();
+        sorted.sort_by_key(|l| l.ts_ms);
+        let pick = |lvl: &str| sorted.iter().filter(|l| l.level == lvl).map(|l| l.text.clone()).take(POST_MAX).collect::<Vec<_>>();
+        let me = client.get("/me", &[]).map_err(|e| e.to_string())?;
+        let shares = me["public_levels"].as_array().is_some_and(|a| !a.is_empty());
+        let link = match (shares, me["handle"].as_str()) {
+            (true, Some(h)) => Some(format!("{}/@{h}", ctx.base.trim_end_matches('/').trim_start_matches("https://").trim_start_matches("http://"))),
+            _ => None,
+        };
+        return match post_text(&pick("LEARN"), &pick("WIN"), link.as_deref()) {
+            Some(t) => {
+                println!("{t}");
+                Ok(())
+            }
+            None => Err("no LEARN or WIN lines this week to post".into()),
+        };
     }
     let local = |ms: i64| chrono::Local.timestamp_millis_opt(ms).single();
     let label = |ms: i64| local(ms).map(|d| d.format("%-d %b").to_string().to_lowercase()).unwrap_or_default();
@@ -595,8 +636,9 @@ fn update_notice() {
         .and_then(|v| v["tag_name"].as_str().map(str::to_string));
     if let Some(l) = latest {
         if state::newer(&l, env!("CARGO_PKG_VERSION")) {
+            let installer = if cfg!(windows) { "irm https://hlog.dev/install.ps1 | iex" } else { "curl -fsSL https://hlog.dev/install.sh | sh" };
             eprintln!(
-                "\nhlog {} is available (you have {}). update: curl -fsSL https://hlog.dev/install.sh | sh  ·  cargo install hlog",
+                "\nhlog {} is available (you have {}). update: {installer}  ·  cargo install hlog",
                 l.trim_start_matches('v'),
                 env!("CARGO_PKG_VERSION")
             );
@@ -606,6 +648,115 @@ fn update_notice() {
     state::save(&st);
 }
 
+
+/// Same limit as the server (lines/levels.ts), counted the same way, so an over-long line fails now
+/// instead of sitting in the offline queue and failing at `hlog sync`.
+const MAX_LINE_CHARS: usize = 500;
+const POST_MAX: usize = 10;
+
+/// Characters the server will count: line breaks (CR, LF, U+2028, U+2029) collapse to one space, tabs
+/// become spaces, ends trimmed, and a leading level word ("WARN …") doesn't count when no level is given.
+fn line_length(text: &str, level: Option<&str>) -> usize {
+    let mut norm = String::with_capacity(text.len());
+    let mut in_break = false;
+    for c in text.chars() {
+        if matches!(c as u32, 0x0D | 0x0A | 0x2028 | 0x2029) {
+            if !in_break {
+                norm.push(' ');
+            }
+            in_break = true;
+            continue;
+        }
+        in_break = false;
+        norm.push(if c == '\t' { ' ' } else { c });
+    }
+    let mut t = norm.trim();
+    if level.is_none() {
+        if let Some((word, rest)) = t.split_once(' ') {
+            if LEVELS.contains(&word.to_lowercase().as_str()) {
+                t = rest.trim_start_matches(' ');
+            }
+        }
+    }
+    t.chars().count()
+}
+
+fn check_length(text: &str, level: Option<&str>) -> Result<(), String> {
+    let n = line_length(text, level);
+    if n > MAX_LINE_CHARS {
+        return Err(format!("line is longer than {MAX_LINE_CHARS} characters ({} over)", n - MAX_LINE_CHARS));
+    }
+    Ok(())
+}
+
+/// The same text as "copy as post" on the web review page: your own lines, word for word.
+fn post_text(learn: &[String], win: &[String], link: Option<&str>) -> Option<String> {
+    if learn.is_empty() && win.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !learn.is_empty() {
+        parts.push(std::iter::once("what I learned this week:".to_string()).chain(learn.iter().map(|t| format!("– {t}"))).collect::<Vec<_>>().join("\n"));
+    }
+    if !win.is_empty() {
+        let head = if learn.is_empty() { "what I shipped this week:" } else { "and shipped:" };
+        parts.push(std::iter::once(head.to_string()).chain(win.iter().map(|t| format!("– {t}"))).collect::<Vec<_>>().join("\n"));
+    }
+    if let Some(l) = link {
+        parts.push(format!("my log: {l}"));
+    }
+    Some(parts.join("\n\n"))
+}
+
+/// "@maya#12" or "maya#12" -> ("maya", 12)
+fn parse_ref(s: &str) -> Option<(String, u64)> {
+    let (h, n) = s.trim().trim_start_matches('@').split_once('#')?;
+    let handle_ok = h.len() >= 3
+        && h.len() <= 20
+        && h.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let seq: u64 = n.parse().ok().filter(|&n| n > 0)?;
+    handle_ok.then(|| (h.to_lowercase(), seq))
+}
+
+fn save_cmd(ctx: &Ctx, (handle, seq): &(String, u64), on: bool) -> Result<(), String> {
+    let client = ctx.authed()?;
+    if on {
+        client.post("/saves", serde_json::json!({ "ref": format!("@{handle}#{seq}") })).map_err(|e| e.to_string())?;
+        println!("saved @{handle}#{seq} (private; `hlog saved` lists your saved lines)");
+    } else {
+        client.delete(&format!("/saves/{handle}/{seq}")).map_err(|e| e.to_string())?;
+        println!("unsaved @{handle}#{seq}");
+    }
+    Ok(())
+}
+
+fn saved_cmd(ctx: &Ctx, level: Option<String>, q: String) -> Result<(), String> {
+    let mut query = vec![("limit", "100".to_string())];
+    if let Some(l) = level {
+        query.push(("level", l));
+    }
+    if !q.trim().is_empty() {
+        query.push(("q", q));
+    }
+    let v = ctx.authed()?.get("/saved", &query).map_err(|e| e.to_string())?;
+    let items = v["items"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        eprintln!("nothing saved (save someone's public line with `hlog save @maya#12`)");
+        return Ok(());
+    }
+    // Newest saved at the bottom, like tail.
+    for it in items.iter().rev() {
+        match serde_json::from_value::<Line>(it["line"].clone()) {
+            Ok(l) => println!("{}", ctx.style.line(&l, true)),
+            Err(_) => {
+                let r = it["ref"].as_str().unwrap_or("?");
+                println!("{}", ctx.style.dim(&format!("{r} is no longer available (remove it: hlog unsave {r})")));
+            }
+        }
+    }
+    Ok(())
+}
 
 fn grep(ctx: &Ctx, q: &str) -> Result<(), String> {
     let page = ctx.authed()?.page("/lines", &[("q", q.to_string()), ("limit", "100".into())]).map_err(|e| e.to_string())?;
@@ -693,6 +844,44 @@ fn logout(ctx: &Ctx) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn line_length_matches_the_server() {
+        use super::line_length;
+        assert_eq!(line_length("  hello  ", None), 5);
+        assert_eq!(line_length("WARN disk full", None), 9);
+        assert_eq!(line_length("WARN disk full", Some("INFO")), 14);
+        assert_eq!(line_length("a\r\n\nb", None), 3);
+        assert_eq!(line_length("a\tb", None), 3);
+        let sep: String = [char::from_u32(0x2028).unwrap(), char::from_u32(0x2029).unwrap()].iter().collect();
+        assert_eq!(line_length(&format!("a{sep}b"), None), 3);
+        assert_eq!(line_length(&"😀".repeat(500), None), 500);
+        assert!(super::check_length(&"x".repeat(501), None).unwrap_err().contains("1 over"));
+        assert!(super::check_length(&format!("LEARN {}", "x".repeat(500)), None).is_ok());
+    }
+
+    #[test]
+    fn post_text_matches_the_web() {
+        use super::post_text;
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            post_text(&s(&["a", "b"]), &s(&["shipped c"]), Some("hlog.dev/@sid")).unwrap(),
+            "what I learned this week:\n– a\n– b\n\nand shipped:\n– shipped c\n\nmy log: hlog.dev/@sid"
+        );
+        assert_eq!(post_text(&[], &s(&["w"]), None).unwrap(), "what I shipped this week:\n– w");
+        assert!(post_text(&[], &[], Some("x")).is_none());
+    }
+
+    #[test]
+    fn parses_line_refs() {
+        use super::parse_ref;
+        assert_eq!(parse_ref("@Maya#12"), Some(("maya".into(), 12)));
+        assert_eq!(parse_ref("maya#3"), Some(("maya".into(), 3)));
+        assert_eq!(parse_ref("@ma#1"), None);
+        assert_eq!(parse_ref("@maya#0"), None);
+        assert_eq!(parse_ref("@maya"), None);
+        assert_eq!(parse_ref("@1maya#2"), None);
+    }
+
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {
