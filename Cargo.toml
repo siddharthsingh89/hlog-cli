@@ -1,6 +1,6 @@
 [package]
 name = "hlog"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "hlog — a log for humans. Append, tail and grep your hlog from the terminal."
 license = "MIT"
