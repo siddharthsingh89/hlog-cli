@@ -33,6 +33,7 @@ usage:
   hlog follow @maya [--level LEARN]
   hlog unfollow @maya
   hlog sync                        send lines that were queued while offline
+  hlog whoami                      which account this machine is logged in as
   hlog logout                      revoke this machine's token and forget it
   hlog version                     print the version (also -V, --version)
   hlog -- tail is a word too       log text that starts with a command name
@@ -161,6 +162,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             saved_cmd(&ctx, level, rest.join(" "))
         }
         Some("logout") => logout(&ctx),
+        Some("whoami") if args.len() == 1 => whoami(&ctx),
         Some("tail") => {
             let (follow_mode, level, rest) = flags(&args[1..])?;
             no_extra(&rest)?;
@@ -808,8 +810,13 @@ fn login(ctx: &Ctx) -> Result<(), String> {
         match client.post("/device/token", serde_json::json!({ "device_code": device })) {
             Ok(Some(v)) => {
                 let token = v["token"].as_str().ok_or("bad response from server")?.to_string();
-                config::save(&config::Config { api: Some(ctx.base.clone()), token: Some(token) })?;
-                println!("logged in. token saved to {}", config::path()?.display());
+                config::save(&config::Config { api: Some(ctx.base.clone()), token: Some(token.clone()) })?;
+                // Say which account this machine is now: with two accounts it's easy to approve the wrong one.
+                let who = Client::new(&ctx.base, Some(token)).get("/me", &[]).ok().and_then(|me| me["handle"].as_str().map(str::to_string));
+                match who {
+                    Some(h) => println!("logged in as @{h}. token saved to {}", config::path()?.display()),
+                    None => println!("logged in (this account has no handle yet: pick one at {}/welcome). token saved to {}", ctx.base.trim_end_matches('/'), config::path()?.display()),
+                }
                 println!();
                 println!("next:");
                 println!("  hlog learn \"something you figured out today\"   # write your first line (private by default)");
@@ -829,6 +836,28 @@ fn login(ctx: &Ctx) -> Result<(), String> {
             },
             Err(e) => return Err(e.to_string()),
         }
+    }
+}
+
+/// `@hen on hlog.dev (cli · laptop)`, or how to log in.
+fn whoami(ctx: &Ctx) -> Result<(), String> {
+    let host = ctx.base.trim_end_matches('/').trim_start_matches("https://").trim_start_matches("http://").to_string();
+    if ctx.token.is_none() {
+        println!("not logged in to {host} (run `hlog login`)");
+        return Ok(());
+    }
+    match ctx.client().get("/me", &[]) {
+        Ok(me) => {
+            let handle = me["handle"].as_str().map(|h| format!("@{h}")).unwrap_or_else(|| "(no handle yet)".into());
+            let token = me["token"]["name"].as_str().unwrap_or("this machine");
+            println!("{handle} on {host} {}", ctx.style.dim(&format!("({token})")));
+            Ok(())
+        }
+        Err(ApiError::Http { status: 401, .. }) => {
+            println!("this machine's token for {host} no longer works (revoked or expired). run `hlog login` again.");
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
