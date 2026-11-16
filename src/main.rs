@@ -492,7 +492,8 @@ fn stream(ctx: &Ctx, path: &str, base_query: Vec<(&str, String)>, follow_mode: b
         return Ok(());
     }
     let mut newest = page.lines.first().map(|l| l.cursor.clone()).unwrap_or_else(|| format!("{}-0", chrono::Utc::now().timestamp_millis()));
-    let mut wait = POLL_SECS;
+    let (min, max) = poll_window(&client);
+    let mut wait = min;
     loop {
         sleep(Duration::from_secs(wait));
         let mut q = base_query.clone();
@@ -510,20 +511,29 @@ fn stream(ctx: &Ctx, path: &str, base_query: Vec<(&str, String)>, follow_mode: b
                 if kind == Stream::Feed {
                     remember_feed(ctx, &fresh);
                 }
-                wait = next_poll(wait, !fresh.is_empty());
+                wait = next_poll(wait, !fresh.is_empty(), min, max);
             }
             // Keep tailing through network blips, but don't hammer while the network is gone.
-            Err(ApiError::Network(_)) => wait = next_poll(wait, false),
+            Err(ApiError::Network(_)) => wait = next_poll(wait, false, min, max),
             // Rate limited: wait as long as the server asks, then carry on.
-            Err(ApiError::Http { status: 429, retry_after, .. }) => wait = retry_after.unwrap_or(POLL_MAX_SECS).clamp(POLL_SECS, 300),
+            Err(ApiError::Http { status: 429, retry_after, .. }) => wait = retry_after.unwrap_or(max).clamp(min, 300),
             Err(e) => return Err(e.to_string()),
         }
     }
 }
 
-/// `-f` polling: every 5 s while lines are arriving, then 10, 20, 40, at most 60 s while it's quiet, and back to
-/// 5 s as soon as something new shows up. A terminal left open all day costs ~1,500 requests instead of ~17,000.
-const POLL_MAX_SECS: u64 = 60;
+/// `-f` polling window in seconds: fast while lines arrive, backing off to `max` while quiet. The server sets it
+/// (GET /api/config, so it can change without a CLI release); HLOG_POLL_MIN / HLOG_POLL_MAX override it locally.
+const POLL_DEFAULT: (u64, u64) = (10, 120);
+
+fn poll_window(client: &Client) -> (u64, u64) {
+    let server = client.get("/config", &[]).ok();
+    let from_server = |k: &str| server.as_ref().and_then(|v| v["poll"][k].as_u64());
+    let from_env = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let min = from_env("HLOG_POLL_MIN").or_else(|| from_server("min_seconds")).unwrap_or(POLL_DEFAULT.0).clamp(2, 3600);
+    let max = from_env("HLOG_POLL_MAX").or_else(|| from_server("max_seconds")).unwrap_or(POLL_DEFAULT.1).clamp(min, 3600);
+    (min, max)
+}
 
 /// A line cursor is "<ts_ms>-<id>"; order by time, then id.
 fn cursor_key(c: &str) -> (i64, i64) {
@@ -531,11 +541,11 @@ fn cursor_key(c: &str) -> (i64, i64) {
     (ts.parse().unwrap_or(0), id.parse().unwrap_or(0))
 }
 
-fn next_poll(current: u64, got_new: bool) -> u64 {
+fn next_poll(current: u64, got_new: bool, min: u64, max: u64) -> u64 {
     if got_new {
-        POLL_SECS
+        min
     } else {
-        (current * 2).clamp(POLL_SECS, POLL_MAX_SECS)
+        (current * 2).clamp(min, max)
     }
 }
 
@@ -908,14 +918,17 @@ mod tests {
     #[test]
     fn follow_polling_backs_off_when_quiet_and_resets_on_new_lines() {
         use super::next_poll;
-        let mut w = 5;
+        let mut w = 10;
         let mut seen = vec![];
         for _ in 0..6 {
-            w = next_poll(w, false);
+            w = next_poll(w, false, 10, 120);
             seen.push(w);
         }
-        assert_eq!(seen, vec![10, 20, 40, 60, 60, 60]);
-        assert_eq!(next_poll(60, true), 5);
+        assert_eq!(seen, vec![20, 40, 80, 120, 120, 120]);
+        assert_eq!(next_poll(120, true, 10, 120), 10);
+        // another window from the server
+        assert_eq!(next_poll(5, false, 5, 60), 10);
+        assert_eq!(next_poll(40, false, 5, 60), 60);
     }
 
     #[test]
