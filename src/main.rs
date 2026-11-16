@@ -492,24 +492,50 @@ fn stream(ctx: &Ctx, path: &str, base_query: Vec<(&str, String)>, follow_mode: b
         return Ok(());
     }
     let mut newest = page.lines.first().map(|l| l.cursor.clone()).unwrap_or_else(|| format!("{}-0", chrono::Utc::now().timestamp_millis()));
+    let mut wait = POLL_SECS;
     loop {
-        sleep(Duration::from_secs(POLL_SECS));
+        sleep(Duration::from_secs(wait));
         let mut q = base_query.clone();
         q.push(("after", newest.clone()));
         q.push(("limit", "200".into()));
         match client.page(path, &q) {
             Ok(p) => {
-                if let Some(l) = p.lines.first() {
+                // Only lines newer than the last one shown: /everyone ignores `after`, and this also guards
+                // against any endpoint re-sending lines we already printed.
+                let fresh: Vec<Line> = p.lines.into_iter().filter(|l| cursor_key(&l.cursor) > cursor_key(&newest)).collect();
+                if let Some(l) = fresh.first() {
                     newest = l.cursor.clone();
                 }
-                print_oldest_first(ctx, &p.lines, who);
+                print_oldest_first(ctx, &fresh, who);
                 if kind == Stream::Feed {
-                    remember_feed(ctx, &p.lines);
+                    remember_feed(ctx, &fresh);
                 }
+                wait = next_poll(wait, !fresh.is_empty());
             }
-            Err(ApiError::Network(_)) => continue, // keep tailing through blips
+            // Keep tailing through network blips, but don't hammer while the network is gone.
+            Err(ApiError::Network(_)) => wait = next_poll(wait, false),
+            // Rate limited: wait as long as the server asks, then carry on.
+            Err(ApiError::Http { status: 429, retry_after, .. }) => wait = retry_after.unwrap_or(POLL_MAX_SECS).clamp(POLL_SECS, 300),
             Err(e) => return Err(e.to_string()),
         }
+    }
+}
+
+/// `-f` polling: every 5 s while lines are arriving, then 10, 20, 40, at most 60 s while it's quiet, and back to
+/// 5 s as soon as something new shows up. A terminal left open all day costs ~1,500 requests instead of ~17,000.
+const POLL_MAX_SECS: u64 = 60;
+
+/// A line cursor is "<ts_ms>-<id>"; order by time, then id.
+fn cursor_key(c: &str) -> (i64, i64) {
+    let (ts, id) = c.split_once('-').unwrap_or((c, "0"));
+    (ts.parse().unwrap_or(0), id.parse().unwrap_or(0))
+}
+
+fn next_poll(current: u64, got_new: bool) -> u64 {
+    if got_new {
+        POLL_SECS
+    } else {
+        (current * 2).clamp(POLL_SECS, POLL_MAX_SECS)
     }
 }
 
@@ -879,6 +905,27 @@ fn logout(ctx: &Ctx) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn follow_polling_backs_off_when_quiet_and_resets_on_new_lines() {
+        use super::next_poll;
+        let mut w = 5;
+        let mut seen = vec![];
+        for _ in 0..6 {
+            w = next_poll(w, false);
+            seen.push(w);
+        }
+        assert_eq!(seen, vec![10, 20, 40, 60, 60, 60]);
+        assert_eq!(next_poll(60, true), 5);
+    }
+
+    #[test]
+    fn cursors_order_by_time_then_id() {
+        use super::cursor_key;
+        assert!(cursor_key("1794213300000-25") > cursor_key("1794213300000-24"));
+        assert!(cursor_key("1794213300001-1") > cursor_key("1794213300000-999"));
+        assert!(cursor_key("1794213300000-24") <= cursor_key("1794213300000-24"));
+    }
+
     #[test]
     fn line_length_matches_the_server() {
         use super::line_length;
